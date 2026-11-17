@@ -138,6 +138,33 @@ def _strip_hermes_owned_pythonpath_and_runtime_markers(env: dict) -> None:
         env.pop(_marker, None)
 
 
+def _dependency_generations_root() -> Path | None:
+    """``<installs>/<key>/environments`` for this checkout, or None. A process keeps the
+    generation it booted on in its launcher PYTHONPATH; once a dependency sync commits a NEWER
+    generation, ``selected_venv`` names the new one and the old entry stopped matching, so it
+    leaked into every child (a foreign 3.13 interpreter then loaded 3.14 PIL ``_imaging``)."""
+    try:
+        from pm.environments import install_state_dir
+        return install_state_dir(Path(__file__).resolve().parents[2]) / "environments"
+    except Exception:
+        return None
+
+
+def _is_generation_site_packages(entry: Path, generations: Path | None) -> bool:
+    """Exactly ``<generations>/<id>/venv/lib*/python*/site-packages`` (any generation, any
+    spelling); descendants and other paths are user paths and are kept."""
+    if generations is None:
+        return False
+    parts, base = entry.parts, generations.parts
+    if len(parts) < len(base) + 3 or not _same_path(Path(*parts[:len(base)]), generations):
+        return False
+    rest = [os.path.normcase(p) for p in parts[len(base):]]
+    if rest[-1] != "site-packages" or rest[1] != "venv":
+        return False
+    return (len(rest) == 5 and rest[2].startswith("lib") and rest[3].startswith("python")) or \
+           (len(rest) == 4 and rest[2] == "lib")  # Windows: venv/Lib/site-packages
+
+
 def _strip_hermes_owned_pythonpath(env: dict) -> None:
     """Remove Hermes-owned PYTHONPATH entries: only exact matches of the repo root
     (any launcher spelling) and runtime site-packages — never descendants, which are
@@ -151,8 +178,10 @@ def _strip_hermes_owned_pythonpath(env: dict) -> None:
     if not pp:
         return
     owned_paths = [*_get_hermes_site_packages(env), *_state()._hermes_repo_root_aliases]
+    generations = _dependency_generations_root()
     entries = pp.split(os.pathsep)
-    stripped = [e for e in entries if e and any(_same_path(Path(e), p) for p in owned_paths)]
+    stripped = [e for e in entries if e and (any(_same_path(Path(e), p) for p in owned_paths)
+                                             or _is_generation_site_packages(Path(e), generations))]
     kept = [e for e in entries if e not in stripped]
     if kept:
         env["PYTHONPATH"] = os.pathsep.join(kept)

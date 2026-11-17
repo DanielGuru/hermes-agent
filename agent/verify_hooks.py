@@ -41,6 +41,13 @@ def coding_verify_guidance(config: Optional[dict[str, Any]] = None) -> Optional[
     return CODING_VERIFY_GUIDANCE
 
 
+def pre_verify_every_turn(config: Optional[dict[str, Any]] = None) -> bool:
+    """``agent.pre_verify_every_turn`` (default False): also offer ``pre_verify`` hooks the
+    final answer of turns that edited no files, so plugins can gate non-coding turns
+    (e.g. an unfulfilled "starting now" promise). Off keeps upstream behaviour."""
+    return is_truthy_value(_agent_cfg(config).get("pre_verify_every_turn"), default=False)
+
+
 def _agent_cfg(config: Optional[dict[str, Any]]) -> dict[str, Any]:
     if config is None:
         try:

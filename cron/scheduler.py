@@ -106,9 +106,14 @@ def _job_fallback_chain(job: dict, cfg: Any) -> Optional[list]:
     ``delegate_task`` child follows (``scoped_fallback_chain``): a chain entry is a different
     provider and usually a different model, which is exactly what the pin ruled out. Same-provider
     credential-pool rotation is not the chain and still applies. Unpinned jobs inherit the chain.
+
+    A job may declare its OWN ``fallback_providers`` list: the operator naming the backups a
+    pinned job is allowed to use (e.g. a Sonnet-pinned job that may drop to a subscription GPT).
+    It replaces the inherited chain for pinned and unpinned jobs alike; ``[]`` disables fallback.
     """
     return scoped_fallback_chain(
-        get_fallback_chain(cfg), None, pinned=_job_route_pinned(job), owner="cron job")
+        get_fallback_chain(cfg), job.get("fallback_providers"),
+        pinned=_job_route_pinned(job), owner="cron job")
 
 
 def _fallback_chain_phrase(job: Optional[dict] = None) -> str:

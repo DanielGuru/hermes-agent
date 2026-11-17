@@ -391,6 +391,16 @@ DEFAULT_CONFIG = {
         # keyless ring; the next call tries the chosen backend again (no sticky failover). Off when
         # keyless_fallback is false.
         "keyless_rescue": True,
+        # One-shot keyed backstop (mirror of keyless_rescue): when a call rode the keyless ring and
+        # EVERY vendor came back throttled, retry that one call on the vendor's keyed path if an API
+        # key is present. The next call starts on the free ring again (no sticky failover).
+        # OPT-IN (default false): it is the only path in the web stack that can spend money the
+        # operator did not ask to spend. The single reachable population is a vendor pinned "free"
+        # WITH a key on file -- tier "auto" with a key routes keyed and never touches the ring, so it
+        # can't reach the backstop at all. A free pin is the strongest available signal that the user
+        # wants the free endpoint, so turning this on has to be their decision. Off when
+        # keyless_fallback is false.
+        "keyed_backstop": False,
         # Per-vendor tier for vendors with both a keyless free endpoint and a keyed paid path (exa,
         # parallel, firecrawl, keenable; tavily is opt-in keyless via `hermes tools`, not a ring
         # member). Set by the `hermes tools` picker. "free" = always anonymous endpoint even with a
@@ -1306,6 +1316,15 @@ DEFAULT_CONFIG = {
         "compression_threshold_tokens": 0,
         # Narrowed child toolsets keep the parent's MCP toolsets (toolsets=["web"] keeps MCP); false = strict
         "inherit_mcp_toolsets": True,
+        # Read-only long-term memory for subagents. true = each child may SEARCH the external memory
+        # provider (e.g. hindsight_recall) but never write: no save/edit/delete tools, no auto-retain,
+        # no turn sync or prefetch, no MEMORY.md/USER.md, and the built-in memory tool stays blocked.
+        # memory_read_tools names the tools; [] = the ones the provider marks read-only
+        # (MemoryProvider.read_only_tool_names). A provider that marks tools read-only can be narrowed
+        # here, never widened. Children only get tools the parent exposes. Cost: one provider
+        # initialize() per spawn.
+        "memory_read": False,
+        "memory_read_tools": [],
         # Per-subagent iteration cap (own budget, independent of the parent's).
         "max_iterations": 250,
         # Hard per-summary char ceiling on subagent results, layered on the dynamic budget (each
