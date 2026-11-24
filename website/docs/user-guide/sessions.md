@@ -1203,6 +1203,11 @@ Key tables in `state.db`:
 - `sessions.retention_days` must be a whole number of days `>= 0`. A negative value (or a missing one) is rejected: startup maintenance logs a warning naming the allowed range and skips the sweep instead of treating the future cutoff as "everything" — `sessions.auto_prune: false` is the switch that disables pruning
 - After a prune that actually removed rows, `state.db` is `VACUUM`ed to reclaim disk space only when **both** gates pass: at least `sessions.min_vacuum_interval_days` (default 30) have elapsed since the last successful `VACUUM`, **and** more than 25% of the file's pages are reclaimable (`PRAGMA freelist_count / page_count`). A dense database never pays for a full rewrite to reclaim a few MB (SQLite does not shrink the file on plain DELETE)
 - Pruning runs at most once per `sessions.min_interval_hours` (default 24); the last-run timestamp is tracked inside `state.db` itself so it's shared across every Hermes process in the same `HERMES_HOME`
+- **Stored turn results are trimmed independently of pruning.** With `sessions.trim_settled_results: true` (the default), each result keeps its reply, outcome, usage and accounting, but drops its transcript copy after `sessions.trim_settled_results_after_days` (default `7.0`). This accepts fractional days. Seven days is the minimum for exact retries: smaller positive values are raised to seven; invalid values use the default. Neither the session transcript nor the admission is deleted. Empty replies and bare silence markers keep their transcript copy because delivery may need it.
+- API server admissions (Chat Completions, Responses and Runs) keep their full result regardless of age. An idempotent retry replays the stored result: Responses rebuild tool output and the compressed history for `previous_response_id` after cache eviction, and Chat Completions rebuild `reasoning_content`.
+- On upgrade, a result without a settlement stamp ages from the first pass that sees it. The session's latest message is not proof of when the turn settled. Set `sessions.trim_settled_results: false` to keep full results and skip backfill. The switch also accepts the strings `true`/`false`, `yes`/`no`, `on`/`off` and `1`/`0`, ignoring case and surrounding whitespace. Unrecognized values disable trimming and log a warning. New settlements still record their stamp.
+- If the gateway cannot read the profile's retention policy, it skips trimming for that tick without advancing the trim timer. SQLite discovers candidates in pages of at most 1,000 keys, releasing the reader between pages in both WAL and DELETE journal modes.
+- Backfill and result rewrites release the SQLite write lock between batches. On a large store the **first post-upgrade pass can still trigger an in-process `VACUUM`**, subject to the existing interval, holder and free-page gates. Set `sessions.vacuum_after_prune: false` if you cannot tolerate the database rewrite; trimming still frees pages for SQLite to reuse.
 
 Without pruning, `state.db` grows without bound — multi-GB files within weeks were reported on gateway + cron installs. To bound it, turn it on in `~/.hermes/config.yaml` (or answer `/autoprune on`):
 
@@ -1213,6 +1218,8 @@ sessions:
   vacuum_after_prune: true  # reclaim disk space after a pruning sweep
   min_vacuum_interval_days: 30 # don't rewrite the DB more often than this
   min_interval_hours: 24    # don't re-run the sweep more often than this
+  trim_settled_results: true # trim duplicate transcripts, even with auto_prune off
+  trim_settled_results_after_days: 7.0 # increase to keep full results longer
 ```
 
 Installs that set any of these keys explicitly keep their values; only unset

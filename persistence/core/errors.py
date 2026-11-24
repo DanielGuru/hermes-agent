@@ -48,6 +48,7 @@ __all__ = [
     "SessionLedgered",
     "SessionRowMissing",
     "SessionWriteGuarded",
+    "SettledResultTrimIncomplete",
     "StaleFenceKind",
     "StoreContention",
     "StoreQuarantined",
@@ -70,6 +71,15 @@ class PersistenceError(Exception):
     """Catchable root for every error the persistence boundary is allowed to raise; never raised directly."""
 
     cause = "unknown"
+
+
+class SettledResultTrimIncomplete(PersistenceError):
+    """Committed result rewrites and stamps before a trim failed; the cause is chained."""
+
+    def __init__(self, trimmed: int, stamped: int, cause: Exception) -> None:
+        super().__init__(str(cause))
+        self.trimmed = trimmed
+        self.stamped = stamped
 
 
 class NotFound(PersistenceError):

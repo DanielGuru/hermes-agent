@@ -10,12 +10,14 @@ from __future__ import annotations
 import hashlib
 import os
 import time
+from collections.abc import Callable
 from dataclasses import asdict
 from pathlib import Path
 from typing import Optional
 
+from persistence.authority.vocabulary import RETRY_HORIZON_S
 from persistence.conversation.sessions import CANONICAL_BOT_CHAT_TITLE
-from persistence.core.errors import ExportTooLarge
+from persistence.core.errors import ExportTooLarge, PersistenceError, SettledResultTrimIncomplete
 from persistence.core.identity import SessionId
 from persistence.housekeeping.maintenance import (
     SESSION_PROJECTION_FIELDS, PruneCandidate, PruneCriteria, PruneReclaimEstimate, PruneResult, TreeServeFacts,
@@ -29,7 +31,7 @@ from ..conversation._store.sql_common import _non_continuation_child_sql
 from ..conversation._store.write_guards import _guarded_ids, _write_guards_reject
 from ..gateway._routes import _sql_session_last_active
 from ._portability import SessionPortability
-from ._retirement import prune_retired_tombstones
+from ._retirement import backfill_settled_stamps, prune_retired_tombstones, settled_result_candidates, trim_settled_results
 
 __all__ = ["SQLiteSessionMaintenance"]
 
@@ -41,6 +43,21 @@ _COST_SQL = "COALESCE(s.actual_cost_usd, s.estimated_cost_usd, 0)"
 # Ids per ``IN (?,...)`` list: SQLite caps bound parameters at SQLITE_MAX_VARIABLE_NUMBER (999 on builds
 # < 3.32, 32766 after), and a bulk prune of a cron-heavy store binds tens of thousands of ids.
 _SQL_IN_CHUNK = 900
+
+# Bound each write transaction by keys examined and bytes of result payloads read.
+BATCH = 200
+BATCH_MAX_BYTES = 32 * 1024 * 1024
+BATCH_YIELD_S = 0.05
+
+
+def _mark_trim_incomplete(conn):
+    conn.execute("INSERT OR REPLACE INTO state_meta(key,value) VALUES('settled_result_trim_incomplete','1')")
+    conn.execute("DELETE FROM state_meta WHERE key = 'last_settled_result_trim'")
+
+
+def _complete_trim(conn, now):
+    conn.execute("INSERT OR REPLACE INTO state_meta(key,value) VALUES('last_settled_result_trim',?)", (str(now),))
+    conn.execute("DELETE FROM state_meta WHERE key = 'settled_result_trim_incomplete'")
 
 
 def _id_chunks(ids, size: int = _SQL_IN_CHUNK):
@@ -267,6 +284,76 @@ class SQLiteSessionMaintenance(SessionPortability):
             holder = self._store.holder()
             count = holder._execute_write(_do)
         return PruneResult(count=count, deleted_ids=tuple(SessionId(sid) for sid in removed_ids))
+
+    def settled_result_trim_throttle(self) -> Optional[str]:
+        """Read the last complete pass, ignoring a success superseded by an incomplete pass."""
+        with translated(), self._store.holder()._read_ctx() as conn:
+            row = conn.execute("SELECT value FROM state_meta WHERE key = 'last_settled_result_trim' "
+                               "AND NOT EXISTS (SELECT 1 FROM state_meta WHERE key = 'settled_result_trim_incomplete')"
+                               ).fetchone()
+            return row[0] if row else None
+
+    def complete_settled_result_trim(self, now: float) -> None:
+        """Publish success and clear the retry marker only after the runner finishes."""
+        with translated():
+            self._store.holder()._execute_write(lambda conn: _complete_trim(conn, now))
+
+    def trim_settled_results(self, older_than: Optional[float] = None, *, progress: Callable[[], None] | None = None,
+                             invalidate_throttle: bool | None = None) -> int:
+        """Remove transcript copies, not receipts. Return the count of committed result rewrites."""
+        now = time.time()
+        cutoff = now - max(RETRY_HORIZON_S, older_than if older_than is not None else RETRY_HORIZON_S)
+        stamped = trimmed = 0
+        first_slice = True
+
+        def commit_slice(fn):
+            nonlocal first_slice
+
+            def apply(conn):
+                if first_slice and invalidate_throttle:
+                    _mark_trim_incomplete(conn)
+                return fn(conn)
+
+            value = holder._execute_write(apply)
+            first_slice = False
+            return value
+
+        try:
+            with translated():
+                holder = self._store.holder()
+                missing, candidates = settled_result_candidates(holder, cutoff, progress)
+
+                for offset in range(0, len(missing), BATCH):
+                    ids = missing[offset:offset + BATCH]
+                    stamped += commit_slice(lambda conn, ids=ids: backfill_settled_stamps(conn, ids, now))
+                    if progress is not None:
+                        progress()
+                    if offset + BATCH < len(missing) or candidates:
+                        time.sleep(BATCH_YIELD_S)
+
+                offset = 0
+                while offset < len(candidates):
+                    ids = candidates[offset:offset + BATCH]
+                    examined, changed = commit_slice(
+                        lambda conn, ids=ids: trim_settled_results(conn, ids, cutoff, BATCH_MAX_BYTES))
+                    # A rolled-back callback may be retried. Publish progress only after commit.
+                    offset += examined
+                    trimmed += changed
+                    if progress is not None:
+                        progress()
+                    if offset < len(candidates):
+                        time.sleep(BATCH_YIELD_S)
+        except Exception as exc:
+            failure = SettledResultTrimIncomplete(trimmed, stamped, exc)
+            if first_slice and invalidate_throttle:
+                # No slice committed its marker. Keep an older success from suppressing the retry.
+                try:
+                    with translated():
+                        self._store.holder()._execute_write(_mark_trim_incomplete)
+                except PersistenceError as marker_error:
+                    failure.add_note(f"Could not persist incomplete trim marker: {marker_error}")
+            raise failure from exc
+        return trimmed
 
     def prune_empty_ghost_sessions(self, *, media_root: str) -> tuple[SessionId, ...]:
         cutoff = time.time() - 86400

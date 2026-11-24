@@ -2,6 +2,16 @@
 
 Every verb is one transaction (the worktree and change-watcher probes are read-only). Composite chores are not verbs: ``session_retention``'s ``run_auto_prune_and_vacuum``, ``run_auto_archive`` and ``archive_sessions``, ``hermes_cli.session_export.assert_exports_safe`` and lineage adoption are helpers outside the store that call these verbs; the plugin hook, retired-media collection and transcript-file removal after a delete run in ``after_sessions_removed`` over the ids a verb returns.
 
+Stores may additionally implement ``trim_settled_results(older_than=None, *, progress=None, invalidate_throttle=None) -> int``.
+Only the horizon is required. Call ``progress()`` after each discovery page and committed slice if supplied. A backend
+with ``settled_result_trim_throttle()`` owns its throttle: return the last complete timestamp (None
+when incomplete).
+With ``invalidate_throttle=True``, mark the first slice incomplete in its write transaction.
+Its companion ``complete_settled_result_trim(now)`` publishes success and clears the incomplete
+marker atomically. Return results trimmed, not stamps backfilled. ``SettledResultTrimIncomplete``
+carries committed counts and the original cause.
+Absence of these verbs does not change ``SessionMaintenance`` conformance.
+
 Prune selection: ``older_than_days`` becomes ``last_active_before = now - days * 86400`` unless the criteria set ``last_active_before`` or ``started_before``; a negative value is a ``ValueError``. Only ended rows match unless ``include_open``. Recency (``last_active``) is the freshest of ``last_activity_at`` and the newest stored message timestamp, and ``started_at`` only when the row has neither. ``last_active_before`` also requires an orphan-swept row (``end_reason == ORPHAN_REAP_END_REASON``) to have ended before the cutoff. ``*_like`` filters are case-insensitive substrings, ``provider`` is compared lower-cased, ``cwd_prefix`` is the exact cwd or a path below it, the message bounds read the stored ``message_count``, the token bounds input plus output tokens, the cost bounds the actual cost else the estimate else 0, the tool-call bounds the stored ``tool_call_count``; numeric bounds are inclusive and an empty text filter is unset. ``archived`` is tri-state. Pinned rows, and the unpinned continuations of a pinned segment, are excluded unless ``include_pinned``. ``lineage_tips_only`` drops compression-ended rows and rows titled :data:`~persistence.conversation.sessions.CANONICAL_BOT_CHAT_TITLE`.
 """
 

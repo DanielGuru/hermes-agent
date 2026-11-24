@@ -6,15 +6,20 @@ A delete or prune verb returns the ids it removed; its caller runs ``after_sessi
 from __future__ import annotations
 
 import glob
+import inspect
 import logging
+import math
 import os
+import threading
 import time
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Optional, Sequence
 
 from hermes_startup_watchdog import report_startup_progress
+from persistence.authority.vocabulary import RETRY_HORIZON_S
 from persistence.core.admin import AdminUnsupported, StoreAdmin
+from persistence.core.errors import SettledResultTrimIncomplete
 from persistence.housekeeping.maintenance import AUTO_PRUNE_STALE_OPEN_SOURCES, PruneCriteria
 
 # caplog tests pin the "hermes_state" logger name.
@@ -262,6 +267,155 @@ def run_auto_prune_and_vacuum(
         # Maintenance must never block startup.
         logger.warning("state.db auto-maintenance failed: %s", exc)
         result["error"] = str(exc)
+    finally:
+        if maintenance_lock is not None:
+            admin.release_auto_maintenance_lock(maintenance_lock)
+    return result
+
+
+_settled_trim_warnings: set[tuple[Path, str, str]] = set()
+_settled_trim_warning_lock = threading.Lock()
+
+
+def _warn_trim_setting(home: Path, name: str, raw: object, message: str) -> None:
+    # repr distinguishes YAML types and gives repeated NaNs a stable key.
+    key = (home, name, repr(raw))
+    with _settled_trim_warning_lock:
+        if key in _settled_trim_warnings:
+            return
+        _settled_trim_warnings.add(key)
+    logger.warning("sessions.%s for %s: %s", name, home, message)
+
+
+def settled_trim_settings(sessions: dict, home: Path) -> tuple[bool, float]:
+    switch = sessions.get("trim_settled_results", True)
+    enabled = switch if isinstance(switch, bool) else None
+    if isinstance(switch, str):
+        token = switch.strip().lower()
+        if token in {"true", "yes", "on", "1"}:
+            enabled = True
+        elif token in {"false", "no", "off", "0"}:
+            enabled = False
+    if enabled is None:
+        _warn_trim_setting(home, "trim_settled_results", switch, "unrecognized boolean; trimming disabled")
+    if not enabled:
+        return False, RETRY_HORIZON_S
+
+    days = sessions.get("trim_settled_results_after_days", RETRY_HORIZON_S / 86400)
+    try:
+        if isinstance(days, bool) or not isinstance(days, (int, float, str)):
+            raise ValueError
+        seconds = float(days) * 86400
+    except (ValueError, OverflowError):
+        seconds = 0
+    if math.isfinite(seconds) and seconds >= RETRY_HORIZON_S:
+        return True, seconds
+    _warn_trim_setting(home, "trim_settled_results_after_days", days, "using the minimum exact-retry horizon")
+    return True, RETRY_HORIZON_S
+
+
+def run_configured_session_maintenance(store, scope, sessions, trim_age, sessions_dir):
+    """Keep trim independent of pruning; resolve prune-only paths only when pruning is enabled."""
+    from persistence_assembly import open_store_admin
+
+    if trim_age is not None:
+        run_settled_result_trim(
+            store, open_store_admin(scope, read_only=False), older_than=trim_age,
+            min_interval_hours=int(sessions.get("min_interval_hours", 24)),
+            min_vacuum_interval_days=int(sessions.get("min_vacuum_interval_days", 30)),
+            vacuum=bool(sessions.get("vacuum_after_prune", True)))
+    if sessions.get("auto_archive"):
+        run_auto_archive(store, idle_days=float(sessions.get("auto_archive_days", 3)),
+                         min_interval_hours=int(sessions.get("min_interval_hours", 24)))
+    if sessions.get("auto_prune"):
+        from gateway.session_ingress_media import native_inputs_root
+        run_auto_prune_and_vacuum(
+            store, open_store_admin(scope, read_only=False), store_home=scope.profile_dir,
+            media_root=str(native_inputs_root()), retention_days=int(sessions.get("retention_days", 90)),
+            min_interval_hours=int(sessions.get("min_interval_hours", 24)),
+            min_vacuum_interval_days=int(sessions.get("min_vacuum_interval_days", 30)),
+            vacuum=bool(sessions.get("vacuum_after_prune", True)), sessions_dir=sessions_dir())
+
+
+def _trim_progress() -> None:
+    report_startup_progress(900.0, phase="state_db_settled_result_trim")
+
+
+def run_settled_result_trim(
+    store, admin: StoreAdmin | AdminUnsupported | None, *, min_interval_hours: int = 24, vacuum: bool = True,
+    older_than: Optional[float] = None,
+    min_vacuum_interval_days: int = 30, min_vacuum_freelist_ratio: float = AUTO_VACUUM_MIN_FREELIST_RATIO,
+) -> dict[str, Any]:
+    """Idempotent, never-raising trim of settled admission results past the exact-retry horizon.
+
+    Independent of ``sessions.auto_prune``: it deletes no session, no message and no result field
+    readers use -- only the per-turn transcript copies a LIVE session would otherwise keep for as
+    long as it exists (one long-lived chat held 127 MB of a 2.3 GB store on the reference install,
+    96% of it those copies). Runs at most once per ``min_interval_hours`` (the
+    ``last_settled_result_trim`` state key); VACUUM follows the same throttle, holder and freelist
+    gates as auto-maintenance, and only when rows were trimmed. Returns ``{"skipped", "trimmed",
+    "vacuumed"}`` plus ``"freelist_ratio"`` / ``"vacuum_skipped_holders"`` when a VACUUM was
+    considered. A failed pass reports ``error`` and ``incomplete`` and leaves the trim due.
+    """
+    result: dict[str, Any] = {"skipped": False, "trimmed": 0, "vacuumed": False}
+    if isinstance(admin, AdminUnsupported):
+        admin = None
+    maintenance_lock = None
+    try:
+        trim = getattr(store.maintenance, "trim_settled_results", None)
+        if not callable(trim):
+            result["skipped"] = True
+            return result
+        if admin is not None:
+            maintenance_lock = admin.try_acquire_auto_maintenance_lock()
+            if maintenance_lock is None:
+                result["skipped"] = True
+                return result
+        now = time.time()
+        throttle = getattr(store.maintenance, "settled_result_trim_throttle", None)
+        prior = throttle() if throttle is not None else store.state_meta.get("last_settled_result_trim")
+        since = _seconds_since(now, prior)
+        if since is not None and since < min_interval_hours * 3600:
+            result["skipped"] = True
+            return result
+        _trim_progress()
+        options = {"progress": _trim_progress, "invalidate_throttle": throttle is not None or prior is not None}
+        try:
+            inspect.signature(trim).bind(older_than, **options)
+        except (TypeError, ValueError):
+            options = {}  # Only the horizon is required; never replay a TypeError from inside the verb.
+        trimmed = result["trimmed"] = trim(older_than, **options)
+        if trimmed:
+            logger.info(
+                "state.db settled-result trim: trimmed %d stored result(s) past the exact-retry horizon",
+                trimmed)
+        since_vacuum = _seconds_since(now, store.state_meta.get("last_vacuum"))
+        vacuum_due = since_vacuum is None or since_vacuum >= min_vacuum_interval_days * 86400
+        if admin is not None and vacuum and trimmed and vacuum_due:
+            result["freelist_ratio"] = ratio = admin.freelist_ratio()
+            holders = admin.vacuum_blockers()
+            if holders:
+                result["vacuum_skipped_holders"] = len(holders)
+                logger.debug(
+                    "state.db settled-result trim: skipping VACUUM, %d other process(es) hold the store",
+                    len(holders))
+            elif ratio is None or ratio > min_vacuum_freelist_ratio:
+                try:
+                    report_startup_progress(900.0, phase="state_db_settled_result_vacuum")
+                    admin.vacuum()
+                    result["vacuumed"] = True
+                    store.state_meta.set("last_vacuum", str(now))
+                except Exception as exc:  # health: allow BLE001 -- a failed VACUUM leaves the prune result standing
+                    logger.warning("state.db VACUUM after settled-result trim failed: %s", exc)
+        if throttle is None:
+            store.state_meta.set("last_settled_result_trim", str(now))
+        else:
+            store.maintenance.complete_settled_result_trim(now)
+    except Exception as exc:  # health: allow BLE001 -- maintenance never blocks a turn; the error rides in the result
+        logger.warning("state.db settled-result trim failed: %s", exc)
+        if isinstance(exc, SettledResultTrimIncomplete):
+            result.update(trimmed=exc.trimmed, stamped=exc.stamped)
+        result.update(error=str(exc), incomplete=True)
     finally:
         if maintenance_lock is not None:
             admin.release_auto_maintenance_lock(maintenance_lock)

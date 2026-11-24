@@ -4300,28 +4300,28 @@ def _housekeeping_state_db_maintenance(launch: Optional[tuple[Path, Path]] = Non
     gateway owns (``web_server_sessions``). *launch* carries the launch home's configured transcript
     dir (:func:`_launch_sessions_dir`) so its override still governs its own profile."""
     from hermes_cli.config import load_config as _load_full_config
-    _sess_cfg = (_load_full_config().get("sessions") or {})
-    if not (_sess_cfg.get("auto_archive", False) or _sess_cfg.get("auto_prune", False)):
+    config = _load_full_config()
+    sessions = (config.get("sessions") or {}) if isinstance(config, dict) else {}
+    # Settled-result reclaim is not session pruning: it drops a LIVE session's per-turn replay blobs
+    # once they are past the exact-retry horizon, so it runs even with auto_prune off (opt out with
+    # sessions.trim_settled_results: false). Its own throttle lives in the retention pass.
+    switch = sessions.get("trim_settled_results", True)
+    if type(config) is not dict:
+        logger.warning("Skipping settled-result trim: could not read the profile's retention policy")
+        switch = False
+    off = switch is False or isinstance(switch, str) and switch.strip().lower() in {"false", "no", "off", "0"}
+    if off and not (sessions.get("auto_archive") or sessions.get("auto_prune")):
         return
-    from gateway.session_ingress_media import native_inputs_root
-    from persistence_assembly import open_persistence, open_store_admin, profile_scope
-    from session_retention import run_auto_archive, run_auto_prune_and_vacuum
+    from session_retention import run_configured_session_maintenance, settled_trim_settings
+    enabled, older_than = (False, None) if off else settled_trim_settings(sessions, get_hermes_home())
+    if not (enabled or sessions.get("auto_archive") or sessions.get("auto_prune")):
+        return
+    from persistence_assembly import open_persistence, profile_scope
     scope = profile_scope()
     store = open_persistence(scope, eager=True)
     try:
-        if _sess_cfg.get("auto_archive", False):
-            run_auto_archive(
-                store, idle_days=float(_sess_cfg.get("auto_archive_days", 3)),
-                min_interval_hours=int(_sess_cfg.get("min_interval_hours", 24)))
-        if _sess_cfg.get("auto_prune", False):
-            run_auto_prune_and_vacuum(
-                store, open_store_admin(scope, read_only=False), store_home=scope.profile_dir,
-                media_root=str(native_inputs_root()),
-                retention_days=int(_sess_cfg.get("retention_days", 90)),
-                min_interval_hours=int(_sess_cfg.get("min_interval_hours", 24)),
-                min_vacuum_interval_days=int(_sess_cfg.get("min_vacuum_interval_days", 30)),
-                vacuum=bool(_sess_cfg.get("vacuum_after_prune", True)),
-                sessions_dir=_profile_sessions_dir(launch))
+        run_configured_session_maintenance(store, scope, sessions, older_than if enabled else None,
+                                           lambda: _profile_sessions_dir(launch))
     finally:
         store.close()
 
